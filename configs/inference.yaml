@@ -1,0 +1,29 @@
+# Batch scoring settings. Layer on top of base.yaml:
+#   uv run python scripts/predict.py --config configs/base.yaml --config configs/inference.yaml \
+#       --input data/raw/bank-additional-full.csv --output reports/metrics/call_list.csv
+#
+# No training section: scoring loads a fitted artifact and must never fit anything.
+
+inference:
+  # `latest` follows the pointer written by the last training run. Pin a run
+  # directory name here to freeze a campaign against one specific model.
+  model_id: latest
+
+  batch_size: 10000
+
+  # Reject records that violate the contract instead of coercing them. A silently
+  # mis-typed column is the failure mode that produces a plausible but wrong
+  # ranking, which is worse than an error.
+  validate_input: true
+
+  # Tiers are assigned by rank within the scored batch, not by absolute
+  # probability, so they stay meaningful after the model is recalibrated for a
+  # new economic regime.
+  include_tier: true
+  tier_quantiles: [0.05, 0.20, 0.50]
+  tier_labels: [tier_1, tier_2, tier_3, tier_4]
+
+evaluation:
+  # Scoring produces a ranking; the capacity fraction is what turns it into a
+  # call list. Keep it aligned with the campaign's actual agent hours.
+  capacity_fraction: 0.20

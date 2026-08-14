@@ -1,0 +1,82 @@
+# Containerised entry points. Each service runs one stage of the pipeline against
+# bind-mounted data, artifacts and reports directories, so results survive the
+# container and can be inspected on the host.
+#
+#   docker compose run --rm prepare-data
+#   docker compose run --rm train
+#   docker compose run --rm evaluate
+#   docker compose run --rm predict
+#   docker compose run --rm test
+
+name: term-deposit-propensity
+
+x-common: &common
+  build:
+    context: .
+    target: runtime
+  image: term-deposit-propensity:latest
+  environment:
+    TERM_DEPOSIT_ROOT: /app
+    TERM_DEPOSIT_LOG_LEVEL: ${TERM_DEPOSIT_LOG_LEVEL:-INFO}
+  volumes:
+    - ./data:/app/data
+    - ./artifacts:/app/artifacts
+    - ./reports:/app/reports
+    - ./configs:/app/configs:ro
+  working_dir: /app
+
+services:
+  prepare-data:
+    <<: *common
+    command: ["prepare-data", "--config", "configs/base.yaml"]
+
+  train:
+    <<: *common
+    command:
+      - "train"
+      - "--config"
+      - "configs/base.yaml"
+      - "--config"
+      - "configs/training.yaml"
+    depends_on:
+      prepare-data:
+        condition: service_completed_successfully
+
+  # The same experiment under the protocol the original notebook used, so the
+  # two can be compared without editing a file.
+  train-random:
+    <<: *common
+    command:
+      - "train"
+      - "--config"
+      - "configs/base.yaml"
+      - "--config"
+      - "configs/training.yaml"
+      - "--set"
+      - "split.strategy=random"
+
+  evaluate:
+    <<: *common
+    command: ["evaluate", "--config", "configs/base.yaml"]
+
+  predict:
+    <<: *common
+    command:
+      - "predict"
+      - "--config"
+      - "configs/base.yaml"
+      - "--config"
+      - "configs/inference.yaml"
+      - "--input"
+      - "data/raw/bank-additional-full.csv"
+      - "--output"
+      - "reports/metrics/call_list.csv"
+
+  test:
+    build:
+      context: .
+      target: dev
+    image: term-deposit-propensity:dev
+    environment:
+      TERM_DEPOSIT_ROOT: /app
+    command: ["pytest", "-q", "-m", "not requires_dataset"]

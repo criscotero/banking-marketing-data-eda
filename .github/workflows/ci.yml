@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.5.11"
+  # Bit-reproducible float reductions, so a metric assertion cannot fail because
+  # a runner happened to have a different core count.
+  OMP_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+
+jobs:
+  quality:
+    name: Lint, format and types
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the pinned version. A break on either is a real break.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --all-extras --python ${{ matrix.python-version }}
+
+      - name: Run unit and integration tests
+        # The suite runs on synthetic fixtures, so it needs no network and no
+        # dataset. Tests that do need the real file are marked and skipped here.
+        run: uv run pytest -q -m "not requires_dataset" --cov --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+
+  config:
+    name: Configs load and CLI responds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Every shipped config parses
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          from term_deposit.config import load_config
+
+          base = Path("configs/base.yaml")
+          load_config([base])
+          load_config([base, Path("configs/training.yaml")]).require_training()
+          load_config([base, Path("configs/inference.yaml")])
+          print("configs OK")
+          PY
+
+      - name: Entry points respond
+        run: |
+          uv run python scripts/prepare_data.py --help > /dev/null
+          uv run python scripts/train.py --help > /dev/null
+          uv run python scripts/evaluate.py --help > /dev/null
+          uv run python scripts/predict.py --help > /dev/null
+          uv run term-deposit version
+
+  end-to-end:
+    name: End-to-end on the real dataset
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Depends on UCI being reachable, so it must not gate a pull request. It runs
+    # on main and on demand, where a broken download is worth knowing about.
+    if: github.event_name != 'pull_request'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: Download and verify the dataset
+        run: uv run python scripts/prepare_data.py --config configs/base.yaml
+
+      - name: Train (quick — no cross-validation or backtest)
+        run: |
+          uv run python scripts/train.py \
+            --config configs/base.yaml --config configs/training.yaml --quick
+
+      - name: Re-evaluate the persisted artifact
+        run: uv run python scripts/evaluate.py --config configs/base.yaml --figures
+
+      - name: Score a call list
+        run: |
+          uv run python scripts/predict.py \
+            --config configs/base.yaml --config configs/inference.yaml \
+            --input data/raw/bank-additional-full.csv \
+            --output reports/metrics/call_list.csv \
+            --capacity 0.2
+
+      - name: Run the dataset-dependent tests
+        run: uv run pytest -q -m requires_dataset
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: reports/
+          retention-days: 14
+
+  docker:
+    name: Container builds and runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: term-deposit-propensity:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image can load its configuration
+        run: |
+          docker run --rm --entrypoint python term-deposit-propensity:ci -c \
+            "from term_deposit.config import load_config; load_config(['configs/base.yaml']); print('ok')"
+
+      - name: The CLI is wired up
+        run: docker run --rm term-deposit-propensity:ci version

@@ -1,0 +1,93 @@
+# Shared settings. Every entry point loads this file first, so training,
+# evaluation and inference agree on paths, columns and seeds by construction.
+#
+# Layer task-specific files on top:
+#   --config configs/base.yaml --config configs/training.yaml
+# and override single keys from the command line:
+#   --set split.strategy=random --set features.feature_set=client_only
+
+project_name: term-deposit-propensity
+
+# Applied to python-random, numpy, and every estimator that accepts a seed.
+random_state: 42
+log_level: INFO
+
+paths:
+  raw_dir: data/raw
+  interim_dir: data/interim
+  processed_dir: data/processed
+  artifacts_dir: artifacts
+  reports_dir: reports
+
+data:
+  source_url: https://archive.ics.uci.edu/static/public/222/bank+marketing.zip
+  expected_sha256: 74adfc578bf77a7ff4bb1ba4a9f8709d9e3c6907342959c2c8416847e0afb4d8
+  enforce_checksum: true
+  validate_schema: true
+  # `duration` is known only after a call ends. Keeping it would inflate every
+  # offline metric and could never be reproduced at scoring time.
+  # See docs/methodology.md.
+  drop_columns:
+    - duration
+
+split:
+  # Chronological by default. The random alternative is kept so the two protocols
+  # can be compared directly, which is the point of ADR 0002.
+  strategy: out_of_time
+  # Used only when strategy is `random`.
+  test_size: 0.20
+  validation_size: 0.15
+  # Used only when strategy is `out_of_time`: trailing calendar months held out.
+  # 9 test months covers 2010-03..2010-11; 7 validation months covers 2009-06..2009-12.
+  test_periods: 9
+  validation_periods: 7
+  random_state: 42
+
+features:
+  # `all` includes the macro block; `client_only` drops it, which is how the
+  # project measures what the macro indicators actually contribute (ADR 0003).
+  feature_set: all
+  encode_pdays_sentinel: true
+  scale_numeric: true
+  handle_unknown_categories: ignore
+
+evaluation:
+  # Average precision, not ROC-AUC: with an 11% base rate the ROC curve is
+  # dominated by how the majority class is ordered. See ADR 0005.
+  primary_metric: average_precision
+  top_k_fractions: [0.05, 0.10, 0.20, 0.30]
+  # The threshold is a business decision, selected on validation and then frozen.
+  threshold_objective: expected_value
+  capacity_fraction: 0.20
+  # Placeholder units, not measured euros: they make the cost of a missed
+  # subscriber relative to a wasted call explicit and adjustable.
+  value_per_subscription: 100.0
+  cost_per_call: 5.0
+  # Ranking quality inside a single calendar month, which is the only comparison
+  # a live campaign makes.
+  report_within_period: true
+  within_period_min_rows: 50
+  n_bootstrap: 500
+
+explainability:
+  enabled: false
+  background_size: 200
+  max_display: 20
+  sample_size: 2000
+  random_state: 42
+
+tracking:
+  # File-based by default: no service, no extra dependency, diffable history.
+  # Switch to `mlflow` after `uv sync --extra mlflow` if you want the UI.
+  backend: jsonl
+  experiment_name: term-deposit-propensity
+  tracking_uri: null
+
+inference:
+  model_id: latest
+  batch_size: 10000
+  include_tier: true
+  # Rank-based tiers, so the definition survives recalibration.
+  tier_quantiles: [0.05, 0.20, 0.50]
+  tier_labels: [tier_1, tier_2, tier_3, tier_4]
+  validate_input: true
